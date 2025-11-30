@@ -79,8 +79,12 @@ class MechanicalPressureModel:
         else: 
             p_pred = k1 * eps_mech + k3 * (eps_mech**3) + p0
         
-        # Median Filter smoothing
-        p_pred_smooth = medfilt(p_pred, kernel_size=5)
+        # [Fix V5.1]: Guard against short sequences to avoid edge artifacts
+        if len(p_pred) >= 5:
+            p_pred_smooth = medfilt(p_pred, kernel_size=5)
+        else:
+            # Fallback for extremely short segments
+            p_pred_smooth = p_pred
         
         df_out = df.copy()
         df_out[out_col] = p_pred_smooth
