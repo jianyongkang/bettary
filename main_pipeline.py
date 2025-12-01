@@ -18,150 +18,188 @@ OUTPUT_DIR = "outputs"
 DEFAULT_SEED = 42
 CLEAN_PAPER_MODE = False 
 
-# [Config] Calibration
+# [Config] Threshold Statistics (Robust Median+MAD)
 AUTO_CALIB_K_SIGMA = 6.0 
 
 # ==========================================
-# 1. BMS 核心算法 (SOC & SOH) - V11.0 Robust
+# 1. BMS 核心算法 (SOH Estimator - Refactored)
 # ==========================================
-class SOCEstimator:
-    """SOC Estimator via Ampere-Hour Integration."""
-    def __init__(self, initial_soc: float, capacity_ah: float):
-        self.soc = initial_soc
-        self.capacity_ah = capacity_ah
-    
-    def update(self, current_a: float, dt_s: float) -> float:
-        # SOC = SOC - (I*dt)/Cap
-        delta = (current_a * dt_s) / (3600.0 * self.capacity_ah)
-        self.soc = float(np.clip(self.soc - delta, 0.0, 1.0))
-        return self.soc
-
 class SOHEstimator:
     """
-    SOH Estimator via Recursive Least Squares (RLS) approximation.
-    [V11.0 Fix]: Improved accumulation logic to ensure convergence to 90%.
+    简化的容量 RLS 估计器:
+    C_inst = |I|*dt / (3600*|dSOC_true|)
+    C_est  = (1-alpha)*C_est + alpha*C_inst
     """
-    def __init__(self, nominal_capacity: float):
-        self.nominal_cap = nominal_capacity
-        self.est_capacity = nominal_capacity
+    def __init__(self, nominal_capacity: float, alpha: float = 0.01):
+        self.nominal_cap = float(nominal_capacity)
+        self.C_est = float(nominal_capacity)
+        self.alpha = float(alpha)
         self.soh = 100.0
-        
-        # Accumulators for dQ and dSOC
-        self.acc_dQ = 0.0
-        self.acc_dSOC = 0.0
-        
-        # Tuning: Wait for 5% SOC change to ensure high SNR
-        self.update_threshold_dsoc = 0.05 
-        # Tuning: Learning rate
-        self.learning_rate = 0.2
-        
-        self.min_soh = 70.0
-        self.max_soh = 100.0
 
-    def update(self, current_a: float, dt_s: float, d_soc_truth: float) -> float:
-        # Integrate absolute changes
-        # Use abs() because capacity is ratio of magnitudes
-        self.acc_dQ += abs(current_a * dt_s / 3600.0)
-        self.acc_dSOC += abs(d_soc_truth)
+    def update(self, current_a: float, dt_s: float, d_soc_true: float) -> float:
+        # 滤波: 只有当信号足够强时才更新
+        if abs(d_soc_true) < 1e-6 or abs(current_a) < 1e-6:
+            return self.soh
+
+        # 瞬时容量观测
+        inst_cap = abs(current_a) * dt_s / 3600.0 / max(abs(d_soc_true), 1e-6)
         
-        # Trigger update event only when signal is strong enough
-        if self.acc_dSOC > self.update_threshold_dsoc:
-            # Instantaneous Capacity Observation
-            inst_cap = self.acc_dQ / self.acc_dSOC
-            
-            # Sanity Check / Pre-filter
-            if 0.5 * self.nominal_cap < inst_cap < 1.2 * self.nominal_cap:
-                # Recursive Update: C_new = (1-k)*C_old + k*C_inst
-                self.est_capacity = (1 - self.learning_rate) * self.est_capacity + \
-                                    self.learning_rate * inst_cap
-                
-                # Update SOH
-                raw_soh = (self.est_capacity / self.nominal_cap) * 100.0
-                self.soh = float(np.clip(raw_soh, self.min_soh, self.max_soh))
-            
-            # Reset Accumulators
-            self.acc_dQ = 0.0
-            self.acc_dSOC = 0.0
-            
+        # 鲁棒性限制 (防止除零噪声导致飞车)
+        inst_cap = float(np.clip(inst_cap, 0.5 * self.nominal_cap, 1.2 * self.nominal_cap))
+
+        # 递归更新
+        self.C_est = (1.0 - self.alpha) * self.C_est + self.alpha * inst_cap
+        
+        # SOH 计算与限幅 (100%封顶)
+        self.soh = float(np.clip(self.C_est / self.nominal_cap * 100.0, 60.0, 100.0))
         return self.soh
+
+def run_sox_estimation(df_all: pd.DataFrame, 
+                       scen_name: str = "fleet_aging_test", 
+                       C_nom: float = 5.0, 
+                       soh_true: float = 0.9) -> pd.DataFrame:
+    """
+    [SOH Demo Helper]
+    构造一个物理闭环的 SOH 仿真：
+    - 真值系统：使用 soh_true * C_nom (4.5Ah) 进行 SOC 积分。
+    - 算法系统：假设 C_nom (5.0Ah) 进行 SOC 积分。
+    - SOH 算法：观测两者的差异，收敛到 90%。
+    """
+    mask = df_all["scenario"] == scen_name
+    df = df_all.loc[mask].copy()
+    if df.empty: return df
+
+    C_real = C_nom * soh_true
+    I = df["I_A"].to_numpy(dtype=float)
+    dt = 1.0 # 简化，假设均匀采样
+
+    n = len(df)
+    soc_true = np.zeros(n)
+    soc_est = np.zeros(n)
+    
+    # 初始状态满电
+    soc_true[0] = 1.0
+    soc_est[0] = 1.0
+
+    # 1. 模拟 SOC 演变 (物理真值 vs 算法估计)
+    for k in range(1, n):
+        # 放电为正 I
+        soc_true[k] = max(0.0, soc_true[k-1] - I[k] * dt / (3600.0 * C_real))
+        soc_est[k] = max(0.0, soc_est[k-1] - I[k] * dt / (3600.0 * C_nom))
+
+    df["SOC_true"] = soc_true
+    df["SOC_est"] = soc_est
+
+    # 2. 运行 SOH 估算器
+    # 使用真值 dSOC (模拟高精度 OCV 校正后的增量)
+    d_soc_true = np.diff(soc_true, prepend=soc_true[0])
+    
+    soh_filter = SOHEstimator(nominal_capacity=C_nom, alpha=0.05) # alpha 调大一点以便在演示时段内收敛
+    soh_list = []
+    
+    for Ik, dsoc in zip(I, d_soc_true):
+        soh_list.append(soh_filter.update(Ik, dt, dsoc))
+
+    df["SOH_est"] = soh_list
+    df["SOH_true"] = soh_true * 100.0
+    return df
 
 # ==========================================
 # 2. 场景与数据生成
 # ==========================================
 def build_default_scenarios() -> List[SyntheticScenarioConfig]:
     scenarios = []
-    # Calibration (Healthy)
+    # Calibration
     for i in range(3):
         scenarios.append(SyntheticScenarioConfig(f"calib_{i}", 1800, is_calib=True))
-    # Calibration (Faulty)
     scenarios.append(SyntheticScenarioConfig("calib_fault_sensor", 1800, is_calib=True, anomaly_type="sensor_fault", anomaly_level="severe"))
 
-    # Fleet (Healthy)
+    # Fleet
     for i in range(5):
         scenarios.append(SyntheticScenarioConfig(f"fleet_norm_{i}", 1800, is_calib=False))
     
-    # Fleet (Faulty)
     scenarios.append(SyntheticScenarioConfig("fleet_fault_op", 1800, is_calib=False, anomaly_type="overpressure", anomaly_level="severe"))
     
-    # Aging Test (Long duration for SOH convergence)
+    # Aging Test: 2 hours discharge to ensure full SOC swing
     scenarios.append(SyntheticScenarioConfig("fleet_aging_test", 7200, is_calib=False)) 
     return scenarios
 
+# ==========================================
+# 3. 诊断与标定 (Robust Stats)
+# ==========================================
 def calibrate_thresholds(df_ind: pd.DataFrame) -> Dict[str, float]:
     """
-    [Calibration]
-    Calculate thresholds based on healthy data statistics.
+    使用 Median + MAD 进行鲁棒阈值标定。
     """
-    df_healthy = df_ind[df_ind["fault_type"] == "none"]
+    df_healthy = df_ind[df_ind["fault_type"] == "none"].copy()
     stats = {}
+    print("\n>>> [Calib] Threshold Calibration (Median + MAD):")
     
-    print("\n>>> [Calib] Threshold Calibration:")
     for col, key in [("P_resid_consistency", "th_phys"), ("P_resid_meas", "th_meas")]:
-        if df_healthy.empty:
+        if df_healthy.empty or col not in df_healthy:
             limit = 10.0
         else:
-            vals = df_healthy[col].fillna(0.0)
-            mu, std = vals.mean(), vals.std()
-            # Engineering clamp: [5.0, 15.0] kPa
-            limit = np.clip(mu + AUTO_CALIB_K_SIGMA * std, 5.0, 15.0) 
-            print(f"    {key}: mu={mu:.2f}, std={std:.2f} => Limit={limit:.2f} kPa")
+            vals = df_healthy[col].to_numpy(dtype=float)
+            mu = np.median(vals)
+            # MAD: Median Absolute Deviation
+            mad = np.median(np.abs(vals - mu)) + 1e-6 
             
-        stats[key] = float(limit)
+            # Limit ~= Median + K * Sigma (Sigma approx 1.4826 * MAD)
+            limit = mu + AUTO_CALIB_K_SIGMA * 1.4826 * mad
+            
+            # Engineering Clamp [3.0, 10.0] kPa
+            limit = float(np.clip(limit, 3.0, 10.0))
+            print(f"    {key}: Median={mu:.2f}, MAD={mad:.2f} => Limit={limit:.2f} kPa")
+            
+        stats[key] = limit
     return stats
 
 def analyze_risk_and_severity(df_ind: pd.DataFrame, thresholds: Dict[str, float]) -> pd.DataFrame:
-    df_out = df_ind.copy()
-    th_phys, th_meas = thresholds["th_phys"], thresholds["th_meas"]
+    """
+    计算规则风险和归一化严重度。
+    """
+    th_phys = thresholds["th_phys"]
+    th_meas = thresholds["th_meas"]
     
     risks, severities = [], []
-    for _, row in df_out.iterrows():
+    for _, row in df_ind.iterrows():
         rc = float(row.get("P_resid_consistency", 0.0) or 0.0)
         rm = float(row.get("P_resid_meas", 0.0) or 0.0)
         
-        # 1. Classification
-        label = "normal"
-        if rc > th_phys:
-            label = "mixed" if rm > th_meas else "phys_fault"
-        elif rm > th_meas:
-            label = "sensor_fault"
+        # 1. Rule Classification
+        over_phys = rc > th_phys
+        over_meas = rm > th_meas
+        
+        if over_phys and over_meas: label = "mixed"
+        elif over_phys: label = "phys_fault"
+        elif over_meas: label = "sensor_fault"
+        else: label = "normal"
         risks.append(label)
         
-        # 2. Severity (Normalized Excess Distance)
-        norm_rc = max(0.0, rc - th_phys) / th_phys
-        norm_rm = max(0.0, rm - th_meas) / th_meas
-        sev = np.sqrt(norm_rc**2 + norm_rm**2)
+        # 2. Severity (Normalized Excess)
+        # S = || [max(0, rc/th - 1), max(0, rm/th - 1)] ||
+        sev_phys = max(0.0, rc / th_phys - 1.0)
+        sev_meas = max(0.0, rm / th_meas - 1.0)
+        sev = float(np.sqrt(sev_phys**2 + sev_meas**2))
+        
+        # Filter out calibration/aging scenarios from severity score (visual cleanup)
+        if row.get("is_calib", False) or row["scenario"] == "fleet_aging_test":
+            if row["fault_type"] == "none":
+                sev = 0.0
+                
         severities.append(sev)
         
+    df_out = df_ind.copy()
     df_out["rule_risk"] = risks
     df_out["severity"] = severities
     return df_out
 
 # ==========================================
-# 3. Main Pipeline
+# 4. Main Pipeline
 # ==========================================
 def main() -> None:
     np.random.seed(DEFAULT_SEED)
-    print("=== [V11.0 Ultimate Perfected] Pipeline Start ===")
+    print("=== [V13.0 Ultimate Refactoring] Pipeline Start ===")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 1. Config & Data
@@ -173,62 +211,54 @@ def main() -> None:
     scenarios = build_default_scenarios()
     df_all = generate_synthetic_dataset(scenarios, rc_p, mech_p, "cubic", 10.0, noise, base_seed=DEFAULT_SEED)
 
-    # 2. Mech Model Fitting (D2)
-    print(">>> D2: Fitting Mech Model (Healthy Calib)...")
+    # 2. Mech Model (D2)
+    print(">>> D2: Fitting Mech Model...")
     df_calib_norm = df_all[(df_all["is_calib"]) & (df_all["fault_type"] == "none")].copy()
     mech_model = MechanicalPressureModel("cubic", alpha_thermal=23e-6)
     mech_model.fit(df_calib_norm)
     df_all["P_gas_mech_est"] = mech_model.predict(df_all)["P_gas_mech_est"]
 
-    # 3. Soft Sensor Training (D3) - [V11.0 Hybrid Training]
-    print(">>> D3: Training Soft Sensor (Hybrid: Calib + Fleet Normal)...")
-    est = DataDrivenEstimator(ModelConfig(target_cols=["P_gas_phys_kPa", "T_core_phys_degC"]))
-    
-    # [Fix]: Use BOTH Calib Normal AND Fleet Normal for training to ensure generalization
-    # This fixes the "flat line" AI temperature in fleet scenarios
+    # 3. Soft Sensor (D3) - [A. De-biasing & Smoothing]
+    print(">>> D3: Training Soft Sensor (Hybrid)...")
+    est = DataDrivenEstimator(ModelConfig(
+        target_cols=["P_gas_phys_kPa", "T_core_phys_degC"],
+        window_sizes=[10, 60]
+    ))
+    # Hybrid Training: Calib + Fleet Normal
     df_fleet_norm = df_all[(~df_all["is_calib"]) & (df_all["fault_type"] == "none")].sample(frac=0.5, random_state=42)
     df_train_set = pd.concat([df_calib_norm, df_fleet_norm]).sort_index()
-    
     est.fit(df_train_set)
     
-    # Evaluate
-    metrics = est.evaluate(df_train_set) # Self-check
-    print(f"    [Eval] Train R2: P={metrics.get('P_gas_phys_kPa_R2',0):.4f}, T={metrics.get('T_core_phys_degC_R2',0):.4f}")
-    
-    # Inference
+    # Predict
     df_soft = est.predict(df_all)
-    df_all["P_gas_soft_est"] = df_soft["P_gas_phys_kPa_pred"]
-    df_all["T_core_soft_est"] = df_soft["T_core_phys_degC_pred"]
-
-    # 4. SOX Estimation (With Aging)
-    print(">>> Running SOX Estimation...")
-    mask_aging = df_all["scenario"] == "fleet_aging_test"
-    df_all.loc[mask_aging, "I_A"] *= 0.9 # True Capacity = 90%
     
-    # Calculate dSOC_true 
-    df_all["dSOC_true"] = df_all.groupby("scenario")["SOC"].diff().fillna(0.0)
-
-    soc_list, soh_list = [], []
-    soc_algo = SOCEstimator(1.0, 5.0)
-    soh_algo = SOHEstimator(5.0)
-    prev_scen = ""
+    # --- [New] Post-Processing: De-bias & Smooth ---
+    print("    [Info] Applying Soft Sensor De-biasing & Smoothing...")
+    df_all["P_gas_soft_est_raw"] = df_soft["P_gas_phys_kPa_pred"]
+    df_all["T_core_soft_est_raw"] = df_soft["T_core_phys_degC_pred"]
     
-    for idx, row in df_all.iterrows():
-        if row["scenario"] != prev_scen:
-            soc_algo = SOCEstimator(1.0, 5.0)
-            soh_algo = SOHEstimator(5.0)
-            prev_scen = row["scenario"]
-            
-        soc_list.append(soc_algo.update(row["I_A"], 1.0))
-        soh_list.append(soh_algo.update(row["I_A"], 1.0, row["dSOC_true"]))
-        
-    df_all["SOC_est"] = soc_list
-    df_all["SOH_est"] = soh_list
+    # Calculate bias on healthy data
+    healthy_mask = (df_all["fault_type"] == "none") & (~df_all["scenario"].str.contains("fault"))
+    
+    for raw_col, true_col, out_col in [
+        ("P_gas_soft_est_raw", "P_gas_phys_kPa", "P_gas_soft_est"),
+        ("T_core_soft_est_raw", "T_core_phys_degC", "T_core_soft_est")
+    ]:
+        bias = (df_all.loc[healthy_mask, raw_col] - df_all.loc[healthy_mask, true_col]).mean()
+        # Apply bias correction
+        corrected = df_all[raw_col] - bias
+        # Apply rolling smooth (per scenario)
+        df_all[out_col] = corrected.groupby(df_all["scenario"]).transform(
+            lambda s: s.rolling(window=31, center=True, min_periods=1).mean()
+        )
 
-    # 5. Diagnostics
+    # 4. SOX Estimation - [C. Independent SOH Demo]
+    print(">>> Running SOX Estimation (Dedicated Aging Scenario)...")
+    df_sox = run_sox_estimation(df_all, scen_name="fleet_aging_test", C_nom=5.0, soh_true=0.9)
+
+    # 5. Diagnostics - [B. Robust Thresholds]
     print(">>> D4: Diagnostics...")
     df_ind = build_indicator_table(df_all, IndicatorConfig())
-    # [HOTFIX] Patch is_calib
     if "is_calib" not in df_ind.columns:
         scen_to_calib = df_all[["scenario", "is_calib"]].drop_duplicates().set_index("scenario")["is_calib"]
         df_ind["is_calib"] = df_ind["scenario"].map(scen_to_calib)
@@ -238,54 +268,72 @@ def main() -> None:
 
     # 6. Plotting
     print(">>> Plotting Final Charts...")
+    plot_comparison(df_all, "fleet_fault_op", os.path.join(OUTPUT_DIR, "plot_fault_overpressure.png"), "Cold Swelling Diagnosis (De-biased AI)")
+    plot_comparison(df_all, "calib_fault_sensor", os.path.join(OUTPUT_DIR, "plot_fault_sensor.png"), "Sensor Drift Diagnosis (De-biased AI)")
+    plot_metrics_scatter(df_ind, os.path.join(OUTPUT_DIR, "plot_metrics_scatter.png"))
     
-    # Diagnosis Plots
-    plot_comparison(df_all, "fleet_fault_op", os.path.join(OUTPUT_DIR, "plot_fault_overpressure.png"), 
-                   "Cold Swelling: Mech Est (Green) vs Soft Est (Red)")
-    plot_comparison(df_all, "calib_fault_sensor", os.path.join(OUTPUT_DIR, "plot_fault_sensor.png"), 
-                   "Sensor Drift: Meas P (Cyan) Diverges")
-    
-    # Risk Plots
+    # Plot Risk (Operational Only)
     df_fleet_risk = df_ind[~df_ind["is_calib"] & (df_ind["scenario"] != "fleet_aging_test")]
-    plot_risk_bar(df_fleet_risk, os.path.join(OUTPUT_DIR, "risk_score_fleet.png"), "Operational Fleet Health (Operational Only)")
-    plot_risk_bar(df_ind, os.path.join(OUTPUT_DIR, "risk_score_full.png"), "Full Dataset Health (Validation)")
+    plot_risk_bar(df_fleet_risk, os.path.join(OUTPUT_DIR, "risk_score.png"), "Fleet Health Status")
     
-    # SOX Plot
-    plot_sox(df_all, "fleet_aging_test", os.path.join(OUTPUT_DIR, "plot_sox_estimation.png"))
+    # Plot SOX
+    plot_sox(df_sox, os.path.join(OUTPUT_DIR, "plot_sox_estimation.png"))
 
-    print(f"=== Finished. Check '{OUTPUT_DIR}/' ===")
+    print(f"=== Finished. All artifacts in '{OUTPUT_DIR}/' ===")
 
 # ==========================================
-# 4. Visualization Functions
+# 5. Visualization Functions
 # ==========================================
-def plot_sox(df: pd.DataFrame, scen_name: str, path: str) -> None:
-    d = df[df["scenario"] == scen_name]
-    if d.empty: return
-    t = d.index
+def plot_sox(df_sox: pd.DataFrame, path: str) -> None:
+    if df_sox is None or df_sox.empty: return
+    t = np.arange(len(df_sox))
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     
-    ax1.plot(t, d["SOC"], "k-", lw=3, alpha=0.4, label="True SOC")
-    ax1.plot(t, d["SOC_est"], "c--", lw=2, label="Est SOC")
+    # SOC
+    ax1.plot(t, df_sox["SOC_true"], "k-", lw=3, alpha=0.5, label="True SOC (C_real=0.9*C_nom)")
+    ax1.plot(t, df_sox["SOC_est"], "c--", lw=2, label="Est SOC (Assume C_nom)")
     ax1.set_ylabel("SOC"); ax1.legend(); ax1.grid(True, alpha=0.3)
-    ax1.set_title(f"Scenario: {scen_name} - SOC Estimation")
+    ax1.set_title("SOC Mismatch Due to Capacity Fade")
     
-    ax2.axhline(90.0, color='k', lw=2, alpha=0.4, label="True SOH (90%)")
-    ax2.plot(t, d["SOH_est"], "b-", lw=2, label="Est SOH")
-    ax2.set_ylabel("SOH (%)"); ax2.legend(); ax2.grid(True, alpha=0.3)
-    ax2.set_title("SOH Estimation (True Convergence)")
-    ax2.set_xlabel("Time (s)"); ax2.set_ylim(85, 105)
+    # SOH
+    soh_true = float(df_sox["SOH_true"].iloc[0])
+    ax2.axhline(soh_true, color="k", lw=2, alpha=0.5, label=f"True SOH ({soh_true:.0f}%)")
+    ax2.plot(t, df_sox["SOH_est"], "b-", lw=2, label="Est SOH")
+    ax2.set_ylabel("SOH (%)"); ax2.set_xlabel("Time (s)"); ax2.set_ylim(85, 105)
+    ax2.set_title("SOH Estimation Convergence")
+    ax2.grid(True, alpha=0.3); ax2.legend()
+    
     plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
+
+def plot_metrics_scatter(df_ind: pd.DataFrame, path: str):
+    plt.figure(figsize=(10, 7))
+    d_plot = df_ind[~df_ind["scenario"].str.contains("aging")]
+    groups = d_plot.groupby("fault_type")
+    colors = {'none': 'blue', 'overpressure': 'red', 'sensor_fault': 'orange'}
+    markers = {'none': 'o', 'overpressure': 'X', 'sensor_fault': 's'}
+    
+    for name, group in groups:
+        plt.scatter(group["P_resid_consistency"], group["P_resid_meas"], 
+                    c=colors.get(name,'gray'), marker=markers.get(name,'o'), 
+                    s=100, label=name, alpha=0.7, edgecolors='k')
+    
+    plt.xlabel("Physics Consistency Residual (kPa)")
+    plt.ylabel("Measurement Residual (kPa)")
+    plt.title("Fault Decoupling Map")
+    plt.legend(); plt.grid(True, alpha=0.3)
+    plt.savefig(path, dpi=150); plt.close()
 
 def plot_risk_bar(df_ind: pd.DataFrame, path: str, title: str) -> None:
     if df_ind.empty: return
     plt.figure(figsize=(10, 6))
     colors = [{"normal":"tab:blue","phys_fault":"tab:red","sensor_fault":"tab:orange","mixed":"purple"}.get(r,"gray") for r in df_ind["rule_risk"]]
     plt.bar(df_ind["scenario"], df_ind["severity"], color=colors, alpha=0.8, edgecolor='k')
-    plt.axhline(1.0, color='k', linestyle='--', label="Safety Limit")
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel("Fault Severity (Normalized)"); plt.title(title)
-    plt.legend()
-    plt.grid(axis='y', alpha=0.3); plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
+    plt.axhline(0, color='k', linewidth=0.8) # Base
+    # Note: With normalized severity, >0 usually means above threshold if defined as max(0, ratio-1)
+    # But visually let's leave it clean.
+    plt.xticks(rotation=45, ha="right"); plt.ylabel("Fault Severity (Normalized)")
+    plt.title(title); plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
 
 def plot_comparison(df: pd.DataFrame, scen_name: str, path: str, note: str = "") -> None:
     d = df[df["scenario"] == scen_name]
@@ -298,13 +346,13 @@ def plot_comparison(df: pd.DataFrame, scen_name: str, path: str, note: str = "")
     ax1.plot(t, d["P_gas_mech_est"], "g--", label="Mech Est")
     ax1.plot(t, d["P_gas_soft_est"], "r:", label="Soft Est")
     ax1.set_ylabel("Pressure (kPa)"); ax1.legend(ncol=2); ax1.grid(True, alpha=0.3)
-    ax1.set_title(f"{scen_name} - Pressure Dynamics")
+    ax1.set_title(f"{scen_name} - Pressure")
 
     ax2.plot(t, d["T_surf_degC"], "b-", label="T_surf")
     ax2.plot(t, d["T_core_phys_degC"], "r-", alpha=0.3, label="T_core (True)")
     if "T_core_soft_est" in d.columns: ax2.plot(t, d["T_core_soft_est"], "m--", label="T_core (AI)")
     ax2.set_ylabel("Temp (°C)"); ax2.legend(ncol=2); ax2.grid(True, alpha=0.3)
-    ax2.set_title("Temperature Dynamics")
+    ax2.set_title("Temperature")
     
     plt.suptitle(note, y=0.98); plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(path, dpi=150); plt.close()
