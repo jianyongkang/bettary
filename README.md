@@ -7,7 +7,8 @@
 
 > **A Physics-Data Hybrid Twin Approach (V14.3 Real-Time HIL Ready)**
 >
-> 基于“机理+数据”融合驱动的锂电池数字孪生、故障诊断与 SOX 估算系统
+> 基于“机理+数据”融合驱动的锂电池数字孪生、故障诊断与 SOX 估算系统。
+> **本项目采用离线/在线分离架构，已做好 MCU 移植准备 (MCU-Ready)。**
 
 ## 1. 项目概述 (Overview)
 
@@ -17,7 +18,7 @@
 
 **核心能力：**
 
-* **多维状态反演**：基于 **混合训练策略 (Hybrid Training)** 的软传感器，精准反演**内部气压 ($P_{gas}$)** 与 **核心温度 ($T_{core}$)**。
+* **多维状态反演**：基于 **混合训练策略** 的软传感器，精准反演**内部气压 ($P_{gas}$)** 与 **核心温度 ($T_{core}$)**。
 * **物理/传感故障解耦**：利用物理残差 ($P_{mech}-P_{soft}$) 与测量残差 ($P_{meas}-P_{soft}$) 的正交特性，有效区分 **真实物理故障 (Cold Swelling)** 与 **传感器漂移 (Sensor Drift)**。
 * **高鲁棒 SOX 估算**：内置安时积分 SOC 与 **基于 RLS 的自适应 SOH 估算**，在物理闭环仿真中实现了容量从 100% 向 90% 真值的精准收敛。
 * **量化安全评估**：引入 **归一化严重度 (Normalized Severity)** 指标与 **鲁棒阈值标定**，提供红/橙/蓝分级预警。
@@ -38,14 +39,14 @@
 | **D2** | `mech_strain_pressure.py` | **力学观测器** | 建立壳体应变-压力的非线性本构方程，作为物理一致性基准。 |
 | **D3** | `soft_sensor.py` | **AI 软测量** | **[离线训练]** 采用“标定+车队”混合训练的多目标 XGBoost 模型，解决 OOD 问题。 |
 | **D4** | `diagnostics.py` | **诊断工具** | **[离线分析]** 基于 Median+MAD 的鲁棒统计标定与严重度计算工具。 |
-| **RT** | `online_engine.py` | **在线引擎** | **[V14 新增]** 轻量级推理引擎。脱离 Pandas 依赖，支持 `step(sample)` 逐点调用，易于移植 C 代码。 |
+| **RT** | `online_engine.py` | **在线引擎** | **[MCU 原型]** 轻量级推理引擎。脱离 Pandas 依赖，支持 `step(sample)` 逐点调用，易于移植 C 代码。 |
 
 ### 2.2 应用程序 (Applications)
 
 | 文件 | 用途 | 说明 |
 | :--- | :--- | :--- |
 | `main_pipeline.py` | **离线全链路仿真** | 执行数据生成、模型训练、参数标定及论文级图表绘制。 |
-| `realtime_monitor.py` | **实时 HIL 上位机** | **[V14 新增]** 模拟传感器数据流，调用 `OnlineBMSEngine`，提供动态黑客风仪表盘。 |
+| `realtime_monitor.py` | **实时 HIL 上位机** | **[演示工具]** 模拟传感器数据流，调用 `OnlineBMSEngine`，提供动态黑客风仪表盘。 |
 
 -----
 
@@ -112,6 +113,39 @@ python realtime_monitor.py
 ### [v9.0 - v11.0] - Engineering Refactoring
 
   * **Severity Metric**: 引入归一化严重度指标与鲁棒阈值标定。
+
+-----
+
+## 6\. 实机部署路线图 (MCU Porting Guide)
+
+**`src/online_engine.py` 已按照嵌入式逻辑设计，下一步只需进行语法转译即可上车。**
+
+### 6.1 核心算法 C 化 (Core Algorithm Porting)
+
+  * **目标**：将 `OnlineBMSEngine` 类转换为 `bms_core.c`。
+  * **步骤**：
+    1.  **数据结构**：定义 `BMS_Input_t` (电压、电流等) 和 `BMS_Output_t` (SOC、SOH、报警位)。
+    2.  **去对象化**：将 Python 类方法 `step()` 转换为 C 函数 `BMS_Step(const BMS_Input_t* in, BMS_Output_t* out)`。
+    3.  **移除库依赖**：使用手写 Ring Buffer 替代 `collections.deque`，使用 `math.h` 替代 `numpy`。
+
+### 6.2 AI 模型轻量化 (Model Distillation)
+
+  * **挑战**：MCU 无法直接运行 XGBoost 库。
+  * **方案**：
+      * **方法 A (Treelite)**: 使用 Treelite 将 XGBoost 模型编译为无依赖的 C 代码（if-else 森林）。
+      * **方法 B (查表法)**: 将软传感器离散化为 3D LUT (Look-Up Table)，输入 V/I/T，查表得到 P/T\_core。
+
+### 6.3 参数配置固化 (Configuration Freezing)
+
+  * **现状**：参数分散在 Python 变量中。
+  * **目标**：生成 `bms_config.h`。
+  * **实现**：编写脚本将离线标定的阈值、多项式系数自动生成为 C 头文件宏定义：
+    ```c
+    // bms_config.h (Auto-generated)
+    #define TH_PHYS_KPA  12.5f
+    #define SOH_LEARN_RATE 0.2f
+    static const float MECH_PARAMS[3] = {0.5f, 0.01f, 100.0f}; // k1, k3, p0
+    ```
 
 -----
 
