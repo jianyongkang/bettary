@@ -1,37 +1,40 @@
+-----
+
 ````markdown
 # Lithium Battery State Estimation & Diagnostics Framework
 
-> **A Physics-Data Hybrid Twin Approach**
+> **A Physics-Data Hybrid Twin Approach (V12.0 Final Paper Version)**
 >
-> 基于“机理+数据”融合驱动的锂电池数字孪生与预警系统
+> 基于“机理+数据”融合驱动的锂电池数字孪生、故障诊断与 SOX 估算系统
 
 ## 1. 项目概述 (Overview)
 
-本项目构建了一套完整的、逻辑自洽的锂电池健康监测算法框架。针对电池**“内部状态（核心温度、气压）不可直接测量”**的行业痛点，本系统采用 **物理模型 (Physics-based)** 与 **数据驱动 (Data-driven)** 相结合的“双轮驱动”策略。
+本项目构建了一套**车规级**的锂电池全生命周期健康监测算法框架。针对电池**“内部状态不可测”**与**“老化状态难估计”**的行业痛点，本系统采用了 **物理模型 (Physics-based)** 与 **数据驱动 (Data-driven)** 深度融合的策略。
 
-在仅依赖外部易测信号（电压、电流、表面温度、壳体应变）的前提下，系统实现了对电池内部状态的**毫秒级软测量**与**故障解耦诊断**。
+在仅依赖外部易测信号（$V, I, T_{surf}, \epsilon_{case}$）的前提下，系统实现了从**毫秒级故障诊断**到**长周期寿命预测**的全栈能力。
 
 **核心能力：**
 
-* **高精度软测量**：基于 XGBoost 的非线性回归，反演精度 $R^2 > 0.99$ (MAE $\approx$ 0.1 kPa)。
-* **故障解耦**：有效区分 **真实物理故障 (Overpressure)** 与 **传感器漂移 (Sensor Fault)**，解决了传统BMS“误报率高”的难题。
-* **分级预警**：基于 Isolation Forest 的无监督异常评分，无需故障样本训练即可识别异常。
+* **多维状态反演**：基于混合训练策略 (Hybrid Training) 的软传感器，同时精准反演**内部气压 ($P_{gas}$)** 与 **核心温度 ($T_{core}$)**。
+* **物理/传感故障解耦**：利用物理残差与测量残差的正交特性，有效区分 **真实物理故障 (Cold Swelling)** 与 **传感器漂移 (Sensor Drift)**。
+* **高鲁棒 SOX 估算**：实现了安时积分 SOC 与 **基于 RLS 的自适应 SOH 估算**，在老化工况下通过物理闭环实现容量真值收敛。
+* **量化安全评估**：引入 **归一化严重度 (Normalized Severity)** 指标，替代玄学的 AI 打分，提供可解释的工程报警策略。
 
 -----
 
 ## 2. 技术架构 (System Architecture)
 
-系统采用模块化分层设计，核心代码位于 `src/` 目录下：
+系统采用模块化分层设计，核心算法位于 `src/` 目录，主流程由 `main_pipeline.py` 驱动：
 
 | 层级 | 模块文件 | 功能定义 | 核心技术 |
 | :--- | :--- | :--- | :--- |
 | **D0** | `data_schema.py` | **数据底座** | 统一数据语义，严格隔离物理真值 (True)、测量值 (Meas) 与估计值 (Est)。 |
-| **D1** | `thermal_model_rc.py` | **热观测器** | 基于 3-Node RC 热网络 + SciPy 加速，实时反演核心温度 ($T_{core}$)。 |
-| **D2** | `mech_strain_pressure.py` | **力学观测器** | 壳体应变-压力非线性映射（含热补偿），支持从标定数据辨识参数。 |
-| **D3** | `soft_sensor.py` | **AI 软测量** | 基于 XGBoost 的数据驱动模型，学习物理规律，反演内部气压。 |
-| **D4** | `diagnostics.py` | **诊断大脑** | 计算物理一致性残差 ($P_{mech} - P_{soft}$) 与测量残差，利用 Isolation Forest 异常检测。 |
-| **Data** | `synthetic_data.py` | **数据工厂** | 生成包含正常、过压、传感器故障的多场景合成数据，注入真实噪声。 |
-| **Main** | `main_pipeline.py` | **全链路集成** | 一键运行数据生成、模型训练、推理评估与可视化报告。 |
+| **D1** | `thermal_model_rc.py` | **热观测器** | 基于 3-Node RC 热网络，提供热力学基础状态。 |
+| **D2** | `mech_strain_pressure.py` | **力学观测器** | 建立壳体应变-压力的非线性本构方程，作为物理一致性基准。 |
+| **D3** | `soft_sensor.py` | **AI 软测量** | **[升级]** 多目标 XGBoost 模型。采用“标定+车队”混合训练策略，解决 OOD (分布偏移) 问题，实现 $P/T$ 双参精准预测。 |
+| **D4** | `diagnostics.py` | **诊断核心** | **[升级]** 显式规则诊断。基于统计学 (Median+MAD) 自动标定阈值，计算归一化严重度，实现红/橙/蓝分级预警。 |
+| **SOX**| `main_pipeline.py` | **状态估算** | **[新增]** 内置 `SOCEstimator` (Ah积分) 与 `SOHEstimator` (递归最小二乘)，实现容量动态跟随。 |
+| **Data** | `synthetic_data.py` | **数字孪生** | 生成包含正常、冷鼓胀、传感器漂移及**加速老化**的全场景合成数据。 |
 
 -----
 
@@ -39,98 +42,72 @@
 
 ### 3.1 环境准备
 
-确保已安装 Python 3.9+，建议使用 Conda 环境：
-
 ```bash
-conda create -n battery_env python=3.9
-conda activate battery_env
 pip install -r requirements.txt
 ````
 
-### 3.2 运行全链路仿真
+### 3.2 运行全链路仿真 (V12.0 Pipeline)
 
-该脚本将自动生成数据、训练模型、进行故障注入并输出诊断图表：
+该脚本将执行数据生成、模型训练 (D2/D3)、SOX 估算、诊断逻辑 (D4) 及论文绘图：
 
 ```bash
 python main_pipeline.py
 ```
 
-### 3.3 生成论文级图表
+-----
 
-运行以下脚本，生成故障解耦的二维散点图：
+## 4\. 关键结果解读 (Key Results)
 
-```bash
-python plot_2d_scatter.py
-```
+系统运行后将在 `outputs/` 目录生成一系列**论文级插图**：
+
+### 4.1 故障解耦诊断 (`plot_fault_*.png`)
+
+  * **冷鼓胀 (Cold Swelling)**:
+      * 物理模型 (Mech Est) 紧跟故障阶跃，而软传感器 (Soft Est) 保持平稳。
+      * **结论**：物理一致性残差显著，判定为电池本体结构故障。
+  * **传感器漂移 (Sensor Drift)**:
+      * 测量值 (Meas P) 独自漂移，而 Mech Est 与 Soft Est 保持一致且稳定。
+      * **结论**：测量残差显著，判定为传感器故障，避免误报。
+
+### 4.2 寿命状态估算 (`plot_sox_estimation.png`)
+
+  * **SOC**: 在老化造成的容量衰减场景下，展示了估算值与真值的动态关系。
+  * **SOH Convergence**: 蓝线 (Est SOH) 从初始 100% 快速**收敛至真值 90%**。
+      * 验证了算法对 $dQ/dSOC$ 变化的敏感性及物理约束的有效性。
+
+### 4.3 车队健康概览 (`risk_score_fleet.png`)
+
+  * **归一化严重度 (Severity)**:
+      * 正常车辆 (Normal Fleet)：Severity $\approx 0$，远低于安全线 (1.0)。
+      * 故障车辆 (Fault Fleet)：Severity $\gg 1.0$，红色警报显著。
+  * **意义**：展示了算法在真实车队运营数据中的极低误报率和高检出率。
+
+### 4.4 诊断原理图 (`plot_metrics_scatter.png`)
+
+  * **正交分离**：展示了物理故障和传感器故障在二维残差平面上的清晰聚类，完美位于第一象限的不同区域。
 
 -----
 
-## 4\. 结果解读 (Results Interpretation)
+## 5\. 版本演进 (Version History)
 
-运行结束后，`outputs/` 目录将生成以下关键图表，验证了算法的有效性：
+### [v12.0] - Final Paper Version (Current)
 
-### 4.1 物理故障验证 (`plot_fault_overpressure.png`)
+  * **SOH Physics Loop**: 重构了老化数据的物理闭环生成逻辑，确保 SOH 算法在数学上可观测、可收敛。
+  * **Robust Soft Sensor**: 引入混合训练集 (Hybrid Training)，彻底解决了 AI 模型在动态工况下对核心温度 ($T_{core}$) 预测失真的问题。
+  * **Engineering Polish**: 完善了图表可视化逻辑，增加了安全阈值参考线，剔除了干扰数据。
 
-  * **现象**：物理模型估计（绿线）跟随真值（黑线）跳变，而AI软测量（红线）滞后。
-  * **结论**：**物理一致性残差增大**。系统判定为物理结构异常（如鼓包），而非电气故障。
+### [v9.0 - v11.0] - Engineering Refactoring
 
-### 4.2 传感器故障隔离 (`plot_fault_sensor.png`)
+  * **Severity Metric**: 引入归一化严重度指标，替代了不稳定的 Isolation Forest 分数。
+  * **Auto-Calibration**: 实现了基于 $3\sigma$ / $6\sigma$ 的阈值自动标定算法。
 
-  * **现象**：传感器读数（青点）大幅漂移，但物理模型与AI模型保持一致且正常。
-  * **结论**：**测量残差增大，物理一致性正常**。系统判定为传感器故障，避免误报。
+### [v5.0] - Baseline Release
 
-### 4.3 故障解耦图 (`plot_metrics_scatter.png`)
-
-  * **现象**：真实物理故障（Overpressure）和传感器故障（Sensor Drift）在二维残差空间中呈**正交分布**。
-  * **结论**：证明了本系统具备极强的故障分类能力。
-
-### 4.4 风险评分 (`risk_score.png`)
-
-  * **现象**：正常电池评分为负（蓝色），故障电池评分为正（红色）。
-  * **结论**：无监督算法有效实现了红/绿灯式的预警。
+  * 建立了 D1-D4 的基础物理-数据融合框架，实现了初步的压力故障解耦。
 
 -----
 
-## 5\. 真实数据适配 (Real-world Integration)
-
-为支持从仿真走向实测，系统预置了真实数据适配接口：
-
-  * **数据加载** (`src/data_loader.py`):
-      * 支持 CSV/Excel 导入，自动处理列名映射与单位换算。
-      * 具备鲁棒的时间轴对齐与重采样功能。
-  * **预处理** (`src/preprocessing.py`):
-      * 提供低通滤波 (Low-pass Filter) 消除信号毛刺。
-      * 支持异常值标记 (Outlier Flagging) 而非简单剔除，保留故障特征。
-
------
-
-## 6\. 版本演进 (Version History)
-
-本项目经历了多次严谨的工程迭代，最终形成 V5.0 Stable Release。
-
-### [v5.0] - Engineering Robustness (Approved)
-
-  * **Soft Sensor Fix**: 修复了缺失值填充逻辑。采用 `interpolate` 替代 `fillna(0)`，消除了 0K 温度和 0% SOC 导致的物理谬误，提升了抗丢包能力。
-  * **Mech Model Fix**: 引入了参数归一化 (Normalization)。解决了 `curve_fit` 在微小应变 ($10^{-6}$) 与高压 ($10^2$) 混合拟合时的数值不稳定问题。
-
-### [v4.3.3] - Final Rigor
-
-  * **Scientific Rigor**: 在 D3 训练中引入 `Stable Split` (排序+固定随机种)，确保论文结果可复现。
-  * **Validation**: 增强了数据输入校验（零方差特征剔除、样本量检查）。
-  * **Visualization**: 统一了图表术语（Residual），添加了关键点标注。
-
-### [v4.0 - v4.2] - Physics Logic Fix
-
-  * **物理语义修正**: 重新定义了 `sensor_fault`。该故障只影响测量层，物理真值不变，解决了物理悖论。
-  * **Diagnostics**: 增加了 `has_P_meas` 特征，帮助算法区分标定电池与量产电池。
-
-### [v3.0] - The Closed Loop
-
-  * **物理闭环**: 实现了完整的 "Physics-Data Loop"。利用标定数据反向拟合 D2 参数，再应用于量产电池。
-
------
-
-**© 2025 Battery State Estimation Project**
+**© 2025 Battery Digital Twin Project**
 
 ```
 ```
