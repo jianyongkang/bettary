@@ -89,6 +89,7 @@ class OnlineBMSEngine:
         self.history = deque(maxlen=self.maxlen)
         
         self.prev_soc_true = 1.0
+        self.prev_t_s = None
 
     def _get_mech_pressure(self, eps, t_surf):
         p = self.mech_params
@@ -164,7 +165,15 @@ class OnlineBMSEngine:
         p_soft, t_core_est = self._get_soft_estimates(sample)
         
         # 3. SOX
-        dt = 1.0 # Fixed for demo
+        # Prefer true sampling interval from timestamps; fall back to 1s
+        dt_sample = sample.get('dt_s')
+        if dt_sample is None:
+            if self.prev_t_s is not None:
+                dt_sample = max(1e-3, t_s - self.prev_t_s)
+            else:
+                dt_sample = 1.0
+        dt = float(dt_sample)
+        self.prev_t_s = t_s
         soc = self.soc_algo.update(i_a, dt)
         
         # SOH (Cheat: using ground truth SOC for demo convergence)

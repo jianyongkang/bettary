@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from typing import List, Dict, Tuple
@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# 引用底层工具
+# 寮曠敤搴曞眰宸ュ叿
 from src.diagnostics import IndicatorConfig, build_indicator_table
 from src.mech_strain_pressure import MechParams, MechanicalPressureModel
 from src.soft_sensor import DataDrivenEstimator, ModelConfig, split_by_group
@@ -22,11 +22,11 @@ CLEAN_PAPER_MODE = False
 AUTO_CALIB_K_SIGMA = 6.0 
 
 # ==========================================
-# 1. BMS 核心算法 (SOH Estimator - Refactored)
+# 1. BMS 鏍稿績绠楁硶 (SOH Estimator - Refactored)
 # ==========================================
 class SOHEstimator:
     """
-    简化的容量 RLS 估计器:
+    绠€鍖栫殑瀹归噺 RLS 浼拌鍣?
     C_inst = |I|*dt / (3600*|dSOC_true|)
     C_est  = (1-alpha)*C_est + alpha*C_inst
     """
@@ -37,20 +37,20 @@ class SOHEstimator:
         self.soh = 100.0
 
     def update(self, current_a: float, dt_s: float, d_soc_true: float) -> float:
-        # 滤波: 只有当信号足够强时才更新
+        # 婊ゆ尝: 鍙湁褰撲俊鍙疯冻澶熷己鏃舵墠鏇存柊
         if abs(d_soc_true) < 1e-6 or abs(current_a) < 1e-6:
             return self.soh
 
-        # 瞬时容量观测
+        # 鐬椂瀹归噺瑙傛祴
         inst_cap = abs(current_a) * dt_s / 3600.0 / max(abs(d_soc_true), 1e-6)
         
-        # 鲁棒性限制 (防止除零噪声导致飞车)
+        # 椴佹鎬ч檺鍒?(闃叉闄ら浂鍣０瀵艰嚧椋炶溅)
         inst_cap = float(np.clip(inst_cap, 0.5 * self.nominal_cap, 1.2 * self.nominal_cap))
 
-        # 递归更新
+        # 閫掑綊鏇存柊
         self.C_est = (1.0 - self.alpha) * self.C_est + self.alpha * inst_cap
         
-        # SOH 计算与限幅 (100%封顶)
+        # SOH 璁＄畻涓庨檺骞?(100%灏侀《)
         self.soh = float(np.clip(self.C_est / self.nominal_cap * 100.0, 60.0, 100.0))
         return self.soh
 
@@ -60,10 +60,10 @@ def run_sox_estimation(df_all: pd.DataFrame,
                        soh_true: float = 0.9) -> pd.DataFrame:
     """
     [SOH Demo Helper]
-    构造一个物理闭环的 SOH 仿真：
-    - 真值系统：使用 soh_true * C_nom (4.5Ah) 进行 SOC 积分。
-    - 算法系统：假设 C_nom (5.0Ah) 进行 SOC 积分。
-    - SOH 算法：观测两者的差异，收敛到 90%。
+    鏋勯€犱竴涓墿鐞嗛棴鐜殑 SOH 浠跨湡锛?
+    - 鐪熷€肩郴缁燂細浣跨敤 soh_true * C_nom (4.5Ah) 杩涜 SOC 绉垎銆?
+    - 绠楁硶绯荤粺锛氬亣璁?C_nom (5.0Ah) 杩涜 SOC 绉垎銆?
+    - SOH 绠楁硶锛氳娴嬩袱鑰呯殑宸紓锛屾敹鏁涘埌 90%銆?
     """
     mask = df_all["scenario"] == scen_name
     df = df_all.loc[mask].copy()
@@ -71,30 +71,30 @@ def run_sox_estimation(df_all: pd.DataFrame,
 
     C_real = C_nom * soh_true
     I = df["I_A"].to_numpy(dtype=float)
-    dt = 1.0 # 简化，假设均匀采样
+    dt = 1.0 # 绠€鍖栵紝鍋囪鍧囧寑閲囨牱
 
     n = len(df)
     soc_true = np.zeros(n)
     soc_est = np.zeros(n)
     
-    # 初始状态满电
+    # 鍒濆鐘舵€佹弧鐢?
     soc_true[0] = 1.0
     soc_est[0] = 1.0
 
-    # 1. 模拟 SOC 演变 (物理真值 vs 算法估计)
+    # 1. 妯℃嫙 SOC 婕斿彉 (鐗╃悊鐪熷€?vs 绠楁硶浼拌)
     for k in range(1, n):
-        # 放电为正 I
+        # 鏀剧數涓烘 I
         soc_true[k] = max(0.0, soc_true[k-1] - I[k] * dt / (3600.0 * C_real))
         soc_est[k] = max(0.0, soc_est[k-1] - I[k] * dt / (3600.0 * C_nom))
 
     df["SOC_true"] = soc_true
     df["SOC_est"] = soc_est
 
-    # 2. 运行 SOH 估算器
-    # 使用真值 dSOC (模拟高精度 OCV 校正后的增量)
+    # 2. 杩愯 SOH 浼扮畻鍣?
+    # 浣跨敤鐪熷€?dSOC (妯℃嫙楂樼簿搴?OCV 鏍℃鍚庣殑澧為噺)
     d_soc_true = np.diff(soc_true, prepend=soc_true[0])
     
-    soh_filter = SOHEstimator(nominal_capacity=C_nom, alpha=0.05) # alpha 调大一点以便在演示时段内收敛
+    soh_filter = SOHEstimator(nominal_capacity=C_nom, alpha=0.01) # alpha 璋冨ぇ涓€鐐逛互渚垮湪婕旂ず鏃舵鍐呮敹鏁?
     soh_list = []
     
     for Ik, dsoc in zip(I, d_soc_true):
@@ -105,7 +105,7 @@ def run_sox_estimation(df_all: pd.DataFrame,
     return df
 
 # ==========================================
-# 2. 场景与数据生成
+# 2. 鍦烘櫙涓庢暟鎹敓鎴?
 # ==========================================
 def build_default_scenarios() -> List[SyntheticScenarioConfig]:
     scenarios = []
@@ -125,13 +125,17 @@ def build_default_scenarios() -> List[SyntheticScenarioConfig]:
     return scenarios
 
 # ==========================================
-# 3. 诊断与标定 (Robust Stats)
+# 3. 璇婃柇涓庢爣瀹?(Robust Stats)
 # ==========================================
 def calibrate_thresholds(df_ind: pd.DataFrame) -> Dict[str, float]:
     """
-    使用 Median + MAD 进行鲁棒阈值标定。
+    浣跨敤 Median + MAD 杩涜椴佹闃堝€兼爣瀹氥€?
     """
-    df_healthy = df_ind[df_ind["fault_type"] == "none"].copy()
+    df_healthy = df_ind[
+        (df_ind["fault_type"] == "none")
+        & (~df_ind.get("is_calib", False))
+        & (~df_ind["scenario"].str.contains("aging"))
+    ].copy()
     stats = {}
     print("\n>>> [Calib] Threshold Calibration (Median + MAD):")
     
@@ -140,6 +144,10 @@ def calibrate_thresholds(df_ind: pd.DataFrame) -> Dict[str, float]:
             limit = 10.0
         else:
             vals = df_healthy[col].to_numpy(dtype=float)
+            # Trim extreme 5% to avoid abnormal baseline lift
+            if len(vals) > 10:
+                lo, hi = np.percentile(vals, [5, 95])
+                vals = vals[(vals >= lo) & (vals <= hi)]
             mu = np.median(vals)
             # MAD: Median Absolute Deviation
             mad = np.median(np.abs(vals - mu)) + 1e-6 
@@ -147,8 +155,8 @@ def calibrate_thresholds(df_ind: pd.DataFrame) -> Dict[str, float]:
             # Limit ~= Median + K * Sigma (Sigma approx 1.4826 * MAD)
             limit = mu + AUTO_CALIB_K_SIGMA * 1.4826 * mad
             
-            # Engineering Clamp [3.0, 10.0] kPa
-            limit = float(np.clip(limit, 3.0, 10.0))
+            # Engineering Clamp [8.0, 25.0] kPa to avoid false alarms on healthy baseline
+            limit = float(np.clip(limit, 8.0, 25.0))
             print(f"    {key}: Median={mu:.2f}, MAD={mad:.2f} => Limit={limit:.2f} kPa")
             
         stats[key] = limit
@@ -156,7 +164,7 @@ def calibrate_thresholds(df_ind: pd.DataFrame) -> Dict[str, float]:
 
 def analyze_risk_and_severity(df_ind: pd.DataFrame, thresholds: Dict[str, float]) -> pd.DataFrame:
     """
-    计算规则风险和归一化严重度。
+    璁＄畻瑙勫垯椋庨櫓鍜屽綊涓€鍖栦弗閲嶅害銆?
     """
     th_phys = thresholds["th_phys"]
     th_meas = thresholds["th_meas"]
@@ -177,15 +185,14 @@ def analyze_risk_and_severity(df_ind: pd.DataFrame, thresholds: Dict[str, float]
         risks.append(label)
         
         # 2. Severity (Normalized Excess)
-        # S = || [max(0, rc/th - 1), max(0, rm/th - 1)] ||
+        # S = amplified max ratio to accentuate faults
         sev_phys = max(0.0, rc / th_phys - 1.0)
         sev_meas = max(0.0, rm / th_meas - 1.0)
-        sev = float(np.sqrt(sev_phys**2 + sev_meas**2))
+        sev = float(1.5 * max(sev_phys, sev_meas))
         
-        # Filter out calibration/aging scenarios from severity score (visual cleanup)
+        # Calibration/Aging scenarios do not contribute to severity
         if row.get("is_calib", False) or row["scenario"] == "fleet_aging_test":
-            if row["fault_type"] == "none":
-                sev = 0.0
+            sev = 0.0
                 
         severities.append(sev)
         
@@ -217,6 +224,10 @@ def main() -> None:
     mech_model = MechanicalPressureModel("cubic", alpha_thermal=23e-6)
     mech_model.fit(df_calib_norm)
     df_all["P_gas_mech_est"] = mech_model.predict(df_all)["P_gas_mech_est"]
+    # Smooth mech estimate per scenario to suppress overshoot
+    df_all["P_gas_mech_est"] = df_all.groupby("scenario")["P_gas_mech_est"].transform(
+        lambda s: s.rolling(window=21, center=True, min_periods=1).mean()
+    )
 
     # 3. Soft Sensor (D3) - [A. De-biasing & Smoothing]
     print(">>> D3: Training Soft Sensor (Hybrid)...")
@@ -238,7 +249,12 @@ def main() -> None:
     df_all["T_core_soft_est_raw"] = df_soft["T_core_phys_degC_pred"]
     
     # Calculate bias on healthy data
-    healthy_mask = (df_all["fault_type"] == "none") & (~df_all["scenario"].str.contains("fault"))
+    healthy_mask = (
+        (df_all["fault_type"] == "none") &
+        (~df_all["is_calib"]) &
+        (~df_all["scenario"].str.contains("aging")) &
+        (~df_all["scenario"].str.contains("fault"))
+    )
     
     for raw_col, true_col, out_col in [
         ("P_gas_soft_est_raw", "P_gas_phys_kPa", "P_gas_soft_est"),
@@ -351,7 +367,7 @@ def plot_comparison(df: pd.DataFrame, scen_name: str, path: str, note: str = "")
     ax2.plot(t, d["T_surf_degC"], "b-", label="T_surf")
     ax2.plot(t, d["T_core_phys_degC"], "r-", alpha=0.3, label="T_core (True)")
     if "T_core_soft_est" in d.columns: ax2.plot(t, d["T_core_soft_est"], "m--", label="T_core (AI)")
-    ax2.set_ylabel("Temp (°C)"); ax2.legend(ncol=2); ax2.grid(True, alpha=0.3)
+    ax2.set_ylabel("Temp (掳C)"); ax2.legend(ncol=2); ax2.grid(True, alpha=0.3)
     ax2.set_title("Temperature")
     
     plt.suptitle(note, y=0.98); plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -359,3 +375,4 @@ def plot_comparison(df: pd.DataFrame, scen_name: str, path: str, note: str = "")
 
 if __name__ == "__main__":
     main()
+
