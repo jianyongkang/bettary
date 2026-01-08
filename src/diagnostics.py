@@ -14,9 +14,10 @@ def compute_cycle_indicators(df_cycle: pd.DataFrame, cfg: IndicatorConfig) -> pd
     s = df_cycle.sort_index()
     get = lambda k: s.get(k, pd.Series(np.nan, index=s.index)).values
     
-    P_mech = s.get("P_gas_mech_est", s.get("P_gas_phys_kPa", pd.Series(np.nan))).values
-    P_soft = s.get("P_gas_soft_est", s.get("P_gas_phys_kPa_pred", pd.Series(np.nan))).values
-    P_meas = get("P_gas_kPa") 
+    P_mech = s.get("P_gas_mech_est", s.get("P_gas_phys_kPa", pd.Series(np.nan, index=s.index))).values
+    P_soft = s.get("P_gas_soft_est", s.get("P_gas_phys_kPa_pred", pd.Series(np.nan, index=s.index))).values
+    P_meas = get("P_gas_kPa")
+    P_true = s.get("P_gas_phys_kPa", pd.Series(np.nan, index=s.index)).values
     
     ind = {}
     dQ = s["Q_Ah"].iloc[-1] - s["Q_Ah"].iloc[0] if len(s) > 1 else 0
@@ -42,6 +43,12 @@ def compute_cycle_indicators(df_cycle: pd.DataFrame, cfg: IndicatorConfig) -> pd
         ind["P_resid_meas"] = np.sqrt(np.nanmean((P_meas - P_soft)**2))
     else:
         ind["P_resid_meas"] = np.nan
+
+    # Truth Residual (Truth vs Soft) for visualization fallback when P_meas is missing
+    if not np.all(np.isnan(P_true)) and len(P_soft) == len(P_true):
+        ind["P_resid_truth"] = np.sqrt(np.nanmean((P_true - P_soft)**2))
+    else:
+        ind["P_resid_truth"] = np.nan
 
     ind["has_P_meas"] = 1.0 if not np.all(np.isnan(P_meas)) else 0.0
 

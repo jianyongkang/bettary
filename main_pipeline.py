@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 import os
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -69,9 +69,18 @@ def run_sox_estimation(df_all: pd.DataFrame,
     df = df_all.loc[mask].copy()
     if df.empty: return df
 
+    df = df.sort_index()
     C_real = C_nom * soh_true
     I = df["I_A"].to_numpy(dtype=float)
-    dt = 1.0 # 简化，假设均匀采样
+    if np.isnan(I).any():
+        I = pd.Series(I).interpolate(limit_direction="both").fillna(0.0).to_numpy()
+    t = df.index.to_numpy(dtype=float)
+    if len(t) > 1:
+        dt = float(np.nanmedian(np.diff(t)))
+    else:
+        dt = 1.0
+    if not np.isfinite(dt) or dt <= 0:
+        dt = 1.0
 
     n = len(df)
     soc_true = np.zeros(n)
@@ -281,6 +290,8 @@ def main() -> None:
 
     thresholds = calibrate_thresholds(df_ind)
     df_ind = analyze_risk_and_severity(df_ind, thresholds)
+    if "P_resid_truth" in df_ind.columns:
+        df_ind["P_resid_meas_fallback"] = df_ind["P_resid_meas"].fillna(df_ind["P_resid_truth"])
 
     # 6. Plotting
     print(">>> Plotting Final Charts...")
@@ -291,6 +302,18 @@ def main() -> None:
     # Plot Risk (Operational Only)
     df_fleet_risk = df_ind[~df_ind["is_calib"] & (df_ind["scenario"] != "fleet_aging_test")]
     plot_risk_bar(df_fleet_risk, os.path.join(OUTPUT_DIR, "risk_score.png"), "Fleet Health Status")
+    plot_risk_bar(
+        df_fleet_risk,
+        os.path.join(OUTPUT_DIR, "risk_score_fleet.png"),
+        "Operational Fleet Health (Operational Only)",
+        safety_limit=1.0
+    )
+    plot_risk_bar(
+        df_ind,
+        os.path.join(OUTPUT_DIR, "risk_score_full.png"),
+        "Full Dataset Health (Validation)",
+        safety_limit=1.0
+    )
     
     # Plot SOX
     plot_sox(df_sox, os.path.join(OUTPUT_DIR, "plot_sox_estimation.png"))
@@ -323,28 +346,38 @@ def plot_sox(df_sox: pd.DataFrame, path: str) -> None:
 
 def plot_metrics_scatter(df_ind: pd.DataFrame, path: str):
     plt.figure(figsize=(10, 7))
-    d_plot = df_ind[~df_ind["scenario"].str.contains("aging")]
+    d_plot = df_ind[~df_ind["scenario"].str.contains("aging")].copy()
+    y_col = "P_resid_meas_fallback" if "P_resid_meas_fallback" in d_plot.columns else "P_resid_meas"
+    d_plot = d_plot.dropna(subset=["P_resid_consistency", y_col])
     groups = d_plot.groupby("fault_type")
     colors = {'none': 'blue', 'overpressure': 'red', 'sensor_fault': 'orange'}
     markers = {'none': 'o', 'overpressure': 'X', 'sensor_fault': 's'}
     
     for name, group in groups:
-        plt.scatter(group["P_resid_consistency"], group["P_resid_meas"], 
+        plt.scatter(group["P_resid_consistency"], group[y_col], 
                     c=colors.get(name,'gray'), marker=markers.get(name,'o'), 
                     s=100, label=name, alpha=0.7, edgecolors='k')
     
     plt.xlabel("Physics Consistency Residual (kPa)")
-    plt.ylabel("Measurement Residual (kPa)")
-    plt.title("Fault Decoupling Map")
+    ylabel = "Measurement Residual (kPa)"
+    title = "Fault Decoupling Map"
+    if y_col == "P_resid_meas_fallback":
+        ylabel = "Measurement/Truth Residual (kPa)"
+        title = "Fault Decoupling Map (Truth fallback if no P_meas)"
+    plt.ylabel(ylabel)
+    plt.title(title)
     plt.legend(); plt.grid(True, alpha=0.3)
     plt.savefig(path, dpi=150); plt.close()
 
-def plot_risk_bar(df_ind: pd.DataFrame, path: str, title: str) -> None:
+def plot_risk_bar(df_ind: pd.DataFrame, path: str, title: str, safety_limit: Optional[float] = None) -> None:
     if df_ind.empty: return
     plt.figure(figsize=(10, 6))
     colors = [{"normal":"tab:blue","phys_fault":"tab:red","sensor_fault":"tab:orange","mixed":"purple"}.get(r,"gray") for r in df_ind["rule_risk"]]
     plt.bar(df_ind["scenario"], df_ind["severity"], color=colors, alpha=0.8, edgecolor='k')
     plt.axhline(0, color='k', linewidth=0.8) # Base
+    if safety_limit is not None:
+        plt.axhline(safety_limit, color='k', linestyle='--', linewidth=1.5, label="Safety Limit")
+        plt.legend(loc="upper left")
     # Note: With normalized severity, >0 usually means above threshold if defined as max(0, ratio-1)
     # But visually let's leave it clean.
     plt.xticks(rotation=45, ha="right"); plt.ylabel("Fault Severity (Normalized)")

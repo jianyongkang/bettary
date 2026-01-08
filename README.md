@@ -5,6 +5,7 @@
 > 采用离线/在线分离架构，已做好 MCU 迁移准备（MCU-Ready）。
 
 ## 更新记录 / Change Log
+- 2026-01-08: add SOH estimation NaN handling, scatter fallback residuals, safety-limit risk plots, and README notes.
 - 2026-01-07：修复 `src/data_schema.py` 字段字符串语法错误；`OnlineBMSEngine` 采样间隔改为时间戳/`dt_s` 推导；添加更新记录说明。
 - 2026-01-07：阈值标定仅用健康运营数据并截尾；严重度放大且过滤校准/老化；机械压力估计平滑；软传感去偏仅用健康段；SOH 演示收敛减缓；散点图阈值自动标定。
 - 说明：本节记录日常增量改动（按日期倒序）；大版本里程碑请写在下方“版本演进”章节。
@@ -77,6 +78,8 @@ python realtime_monitor.py
 - **故障解耦诊断**：`outputs/plot_fault_*.png` 展示 Cold Swelling 与 Sensor Drift 的残差分区。
 - **SOH 收敛**：`outputs/plot_sox_estimation.png` 中估计 SOH 从 100% 平滑收敛到 90%。
 - **车队健康评估**：`outputs/risk_score*.png` 展示归一化严重度及分级预警。
+- **Safety-limit views**: outputs/risk_score_fleet.png and outputs/risk_score_full.png add a dashed safety limit line for operational vs full data.
+- **Scatter fallback**: outputs/plot_metrics_scatter.png uses measurement residual when P_gas_kPa exists, otherwise it falls back to truth residual.
 
 -----
 
